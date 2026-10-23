@@ -77,18 +77,12 @@ import vision
 # ----------------------------------------------------------------------------- tuning knobs
 GP = GuidanceParams(
     a_max=0.5,            # sim caps |accel| at 0.5 m/s^2
-    v_cruise=16.0,        # budget is ~16.3 m/s total (1.15 kg / 0.0706 kg per m/s); over-budget is the cheap side
-    v_arrive=16.0,        # == v_cruise -> no braking; the run ends at the 50 m keep-out
+    v_cruise=15.0,        # single main burn up to this speed (~30 s), then coast
+    v_arrive=15.0,        # == v_cruise -> no braking; the run ends at the 50 m keep-out
     keep_out_m=50.0,
     tube_radius=80.0,
-    horizon_s=120.0,
-    plan_wait_s=0.5,      # the radar's full first scan is published at start-up; don't idle
+    horizon_s=90.0,
 )
-# FUEL: JetSelectionActuator charges ~0.0765 kg per m/s of commanded delta-v (per-tick accrual at
-# 60 Hz, Isp 80 s). Nominal 1.15 kg == ~15 m/s total; every m/s above that costs ~6.7 score points,
-# so cruise speed + trims + attitude slews must fit inside 15 m/s. Time: 120/T; 14 m/s -> ~100 s.
-CAMERA_ENABLED = False    # the image API exposes no depth (as_RGB8/RGB16/f32 only), so the camera cannot add
-                          # tracks the radar lacks, and each blocking capture stalls the 60 Hz loop ~0.3 s
 RADAR_N = 500             # ask for everything the radar has (it publishes 200)
 RADAR_EVERY = 6           # loop ticks between radar reads (60 Hz loop -> 10 Hz)
 CAMERA_PERIOD_S = 1.5     # seconds between captures (capture blocks ~0.1-0.3 s)
@@ -98,60 +92,13 @@ CAMERA_FOV = 60.0
 CAMERA_EV = 10.0
 BLOB_THRESHOLD = 40.0     # 0-255 grey; None = auto
 LOG_EVERY_S = 1.0
-# attitude: body +x along the planned coast direction (cameras look forward), +z "up".
-# Rotation jets burn fuel too, so the hold is DEADBANDED: correct only when the pointing error
-# exceeds ATT_DEADBAND_DEG (until it is back under ATT_SETTLE_DEG) or the body is spinning.
-ATT_MODE = "none"         # "none"     : never fire rotation jets; orientation is ignored completely
-                          # "off"      : rate damping only (stops a spin, never points anywhere)
-                          # "deadband" : slew the nose onto the coast line, then hold within a deadband
-                          # "hold"     : continuous PD hold
-                          # Guidance works in the Phobos frame and converts to body axes every tick, so
-                          # attitude is irrelevant to flying; only the cameras care, and rotation jets
-                          # cost delta-v out of the same 15 m/s budget.
+# attitude: body +x along the flight direction (cameras look forward), +z "up"
+ATT_HOLD = False          # False: never fire the rotation jets (saves fuel; guidance works in the
+                          # Phobos frame and is converted to body axes every tick, so orientation
+                          # does not matter for flying - only the cameras care)
 ATT_KP = 0.02
 ATT_KD = 0.30
 ANG_ACC_MAX = 0.05        # rad/s^2, sim cap
-ATT_DEADBAND_DEG = 10.0
-ATT_SETTLE_DEG = 3.0
-ATT_RATE_MAX_DEG_S = 0.5  # damp any spin faster than this even inside the deadband
-
-
-# ----------------------------------------------------------------------------- run overrides / banner
-# tools/sweep.py writes run_overrides.json next to this file; keys that match GuidanceParams fields
-# go into GP, everything else overrides a module-level knob (ATT_MODE, CAMERA_ENABLED, ...).
-import json, hashlib, subprocess, dataclasses
-RUN_TAG = "manual"
-_here = os.path.dirname(os.path.abspath(__file__))
-_ovr_path = os.path.join(_here, "run_overrides.json")
-if os.path.exists(_ovr_path):
-    try:
-        _ovr = json.load(open(_ovr_path))
-        for _k, _v in _ovr.items():
-            if _k == "tag":
-                RUN_TAG = str(_v)
-            elif hasattr(GP, _k):
-                setattr(GP, _k, type(getattr(GP, _k))(_v) if not isinstance(getattr(GP, _k), tuple) else tuple(_v))
-            else:
-                globals()[_k] = _v
-    except Exception as _ex:
-        print(f"run_overrides.json ignored: {_ex}")
-
-
-def _git_short():
-    try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=_here, capture_output=True,
-                              text=True, timeout=5).stdout.strip() or "?"
-    except Exception:
-        return "?"
-
-
-def config_banner() -> str:
-    cfg = dataclasses.asdict(GP)
-    cfg.update(tag=RUN_TAG, git=_git_short(), ATT_MODE=ATT_MODE, CAMERA_ENABLED=CAMERA_ENABLED,
-               CAMERA_PERIOD_S=CAMERA_PERIOD_S, RADAR_EVERY=RADAR_EVERY,
-               files={f: hashlib.md5(open(os.path.join(_here, f), "rb").read()).hexdigest()[:8]
-                      for f in ("Controller.py", "nav.py", "vision.py") if os.path.exists(os.path.join(_here, f))})
-    return "CONFIG " + json.dumps(cfg, default=str)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -341,14 +288,11 @@ p_goal = np.asarray(target.getLocVelAcc().loc_WRT_ExprIn(phobosFrame), float)
 guidance = Guidance(p_start, p_goal, GP)
 up_world = unit(p_start)                         # radial "up" from Phobos centre
 log(f"Start {np.round(p_start, 1)}  goal {np.round(p_goal, 1)}  dist {np.linalg.norm(p_goal - p_start):.0f} m")
-log(config_banner(), "Config")
 
 loop_hz = this.GetParam(st.VarType.double, "LoopFreqHz")
 iteration = 0
 last_log_t = -1e9
 last_cmd_world = np.zeros(3)
-att_active = True          # start by slewing the nose onto the coast line, then hold in deadband
-arrived_latched = False
 exit_flag = False
 
 # ----------------------------------------------------------------------------- main loop
@@ -380,46 +324,16 @@ while not exit_flag:
         tracker.prune(t)
 
     # ---- guidance -------------------------------------------------------------------
-    if arrived_latched:
-        # the run is scored the moment we enter the keep-out sphere; never fly back out
-        SetCommand(np.zeros(3), np.zeros(3))
-        iteration += 1
-        continue
     out = guidance.command(t, p, v, tracker.tracks)
-    if out.done and not arrived_latched:
-        arrived_latched = True
-        dmg = shuttle.GetParam(st.VarType.double, ["Stats", "Damage"])
-        fuel = shuttle.GetParam(st.VarType.double, ["Stats", "FuelUsed"])
-        pl = guidance.plan
-        log("RESULT " + json.dumps(dict(t=round(t, 2), fuel_kg=round(fuel, 3), damage_J=round(dmg, 1),
-                                        dv_used=round(guidance.dv_used, 2), n_plans=guidance.n_plans,
-                                        final_offset_m=round(pl.offset, 1) if pl else None,
-                                        max_tracks=len(tracker.tracks), tag=RUN_TAG)), "Result")
-        SetCommand(np.zeros(3), np.zeros(3))
-        iteration += 1
-        continue
     a_world = out.accel_world
     last_cmd_world = a_world
     a_body = R_bw.T @ a_world
 
-    # ---- attitude: nose along the planned coast line, cameras look where we are going --
-    x_des = guidance.s_hat if guidance.plan is not None else unit(p_goal - p)
+    # ---- attitude: nose along the flight direction, cameras look where we are going --
+    x_des = unit(v) if np.linalg.norm(v) > 2.0 else unit(p_goal - p)
     alpha_body, att_err = attitude_command(R_bw, omega_b, x_des, up_world)
-    rate = np.linalg.norm(omega_b)
-    if ATT_MODE == "deadband":
-        if att_active and math.degrees(att_err) < ATT_SETTLE_DEG:
-            att_active = False
-        elif not att_active and math.degrees(att_err) > ATT_DEADBAND_DEG:
-            att_active = True
-        if not att_active:
-            # inside the deadband: only kill spin, never chase the pointing error
-            alpha_body = -ATT_KD * omega_b if math.degrees(rate) > ATT_RATE_MAX_DEG_S else np.zeros(3)
-    elif ATT_MODE == "off":
-        alpha_body = -ATT_KD * omega_b if math.degrees(rate) > ATT_RATE_MAX_DEG_S else np.zeros(3)
-    elif ATT_MODE == "none":
+    if not ATT_HOLD:
         alpha_body = np.zeros(3)
-    if np.linalg.norm(alpha_body) > ANG_ACC_MAX:
-        alpha_body *= ANG_ACC_MAX / np.linalg.norm(alpha_body)
 
     SetCommand(a_body, alpha_body)
 
@@ -427,7 +341,7 @@ while not exit_flag:
     # the blocking capture (~0.1-0.3 s) is harmless during the long main burn or coast,
     # but we never stall the loop in the middle of a trim or the terminal steer
     quiet = out.mode in ("coast", "burn")
-    if CAMERA_ENABLED and (t - cams.last_t) >= CAMERA_PERIOD_S and (quiet or not CAMERA_ONLY_WHEN_COASTING) and not out.done:
+    if (t - cams.last_t) >= CAMERA_PERIOD_S and (quiet or not CAMERA_ONLY_WHEN_COASTING) and not out.done:
         cams.last_t = t
         try:
             cams.point("top", R_bw.T @ x_des)
@@ -461,12 +375,14 @@ while not exit_flag:
             f"|v_lat|={np.linalg.norm(v - np.dot(v, unit(p_goal - p)) * unit(p_goal - p)):4.2f} "
             f"tracks={len(tracker.tracks)}(+{n_cam_tracks}cam) tube={out.in_tube} "
             f"conf={len(out.threats)} dv={out.dv_needed:4.2f} att={math.degrees(att_err):4.1f}deg "
-            f"dmg={dmg:.0f}J fuel={fuel:.3f}kg(dv={guidance.dv_used:.1f}m/s est={guidance.fuel_est_kg:.2f}) "
-            f"att={'on' if att_active else 'db'} frames={cams.frames}")
+            f"dmg={dmg:.0f}J fuel={fuel:.3f}kg frames={cams.frames}")
         if out.threats:
             th = min(out.threats, key=lambda th: th.tau)
             log(f"  nearest conflict: id{th.track.id} tau={th.tau:4.1f}s miss={np.linalg.norm(th.miss):5.1f}m "
                 f"need={th.clearance:4.1f}m diam={th.track.diameter:4.1f}m", "Threat")
+
+    if out.done:
+        SetCommand(np.zeros(3), np.zeros(3))
 
     iteration += 1
 

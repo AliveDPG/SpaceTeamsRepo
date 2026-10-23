@@ -116,7 +116,7 @@ def run(seed, params=None, verbose=False, radar_n=200, dt=1 / 60, camera=False, 
         if out.done:
             break
         a = out.accel_world
-        fuel += np.linalg.norm(a) * dt * 60.0 / (80.0 * 9.8)   # actuator accrues per 60 Hz tick, no dt
+        fuel += np.linalg.norm(a) * dt / (80.0 * 9.8)
 
         # integrate (gravity ~1e-5 m/s^2, ignored); debris drift
         p = p + v * dt + 0.5 * a * dt * dt
