@@ -406,6 +406,8 @@ class GuidanceParams:
     near_m: float = 300.0
     terminal_s: float = 20.0      # s to go below which the terminal steer may act
     goal_margin_m: float = 10.0   # aim for the keep-out sphere shrunk by this; anywhere inside it wins
+    aim_target_m: float = 30.0    # one early aim correction puts the pass point this far from the centre
+    aim_min_tgo_s: float = 8.0    # don't start a fresh aim correction with less time to go than this
     # direction + speed coasting search
     plan_wait_s: float = 2.0            # s, max wait for the first radar scan before planning
     plan_min_tracks: int = 50           # plan as soon as this many tracks exist
@@ -481,6 +483,7 @@ class Guidance:
         self.last_plan_t = -1e9
         self.trimming = False
         self.burn_done = False
+        self._aiming = False
         self.last_threats: list[Threat] = []
         self._taus = np.arange(0.0, self.P.horizon_s + 0.5, 0.5)
 
@@ -757,7 +760,7 @@ class Guidance:
         lat_need = max(m_norm - R_ok, 0.0)
         lat_have = 0.25 * P.a_max * t_go * t_go
         aim_pt = self.p_goal - (m_pass / m_norm) * min(R_ok, m_norm) if m_norm > 1e-6 else self.p_goal
-        if s_go < 0.0 or (t_go < P.terminal_s and lat_need > 0.0) or lat_need > 0.8 * lat_have:
+        if s_go < 0.0 or (t_go < P.aim_min_tgo_s and lat_need > 0.0) or lat_need > 0.8 * lat_have:
             v_des = v_allow * unit(aim_pt - p)
             dv = v_des - v
             dvn = float(np.linalg.norm(dv))
@@ -791,25 +794,30 @@ class Guidance:
                 return out
             self.burn_done = True
 
-        # ---- cross-track: corridor return, only when worth it and only if safe -----------
+        # ---- cross-track: ONE early aim correction instead of late terminal steering ------
+        # Predict the lateral miss of the ship's centre when we pass it.  If we would miss the
+        # keep-out sphere, apply the small lateral delta-v that moves the pass point to
+        # aim_target_m from the centre - done as early as possible (delta-v ~ miss / t_go),
+        # then nothing more unless the prediction drifts outside the sphere again.
         if not self.trimming:
-            T_ret = float(np.clip(0.6 * t_go, 8.0, 40.0))
-            v_lat_des = -e / T_ret
-            nrm = np.linalg.norm(v_lat_des)
-            if nrm > 3.0:
-                v_lat_des *= 3.0 / nrm
-            dv_vec = v_lat_des - v_lat
-            dvn = float(np.linalg.norm(dv_vec))
-            band = P.lat_vel_deadband_near if remaining < P.near_m else P.lat_vel_deadband
-            if dvn > band:
-                n = dv_vec / dvn
-                threats_h = self.closest_approaches(t, p, v, snap, P.hysteresis_m + 1.0)
-                # full correction if safe, else the largest safe fraction of it
-                for frac in (1.0, 0.5, 0.25):
-                    if self.safe_up_to(n, threats_h, frac * dvn):
-                        a_lat = n * min(P.a_max, frac * dvn / 1.0)
-                        out.mode = "trim-drift"
-                        break
+            R_ok = P.keep_out_m - P.goal_margin_m
+            m_pass = e_goal - v_lat * t_go
+            m_norm = float(np.linalg.norm(m_pass))
+            if self._aiming or (m_norm > R_ok and t_go > P.aim_min_tgo_s):
+                target = (m_pass / m_norm) * min(P.aim_target_m, m_norm) if m_norm > 1e-6 else np.zeros(3)
+                dv_vec = (m_pass - target) / max(t_go, 1.0)
+                dvn = float(np.linalg.norm(dv_vec))
+                if dvn < 0.03:
+                    self._aiming = False          # converged: pass point is inside the sphere
+                else:
+                    n_dir = dv_vec / dvn
+                    threats_h = self.closest_approaches(t, p, v, snap, P.hysteresis_m + 1.0)
+                    if self.safe_up_to(n_dir, threats_h, dvn):
+                        self._aiming = True
+                        a_lat = n_dir * min(P.a_max, dvn / 0.5)
+                        out.mode = "aim"
+                    else:
+                        self._aiming = False      # blocked by debris; the terminal steer is the fallback
 
         # ---- along-track: coast with a deadband, brake only if asked ----------------------
         err = v_allow - v_s

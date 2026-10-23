@@ -77,11 +77,11 @@ import vision
 # ----------------------------------------------------------------------------- tuning knobs
 GP = GuidanceParams(
     a_max=0.5,            # sim caps |accel| at 0.5 m/s^2
-    v_cruise=15.0,        # single main burn up to this speed (~30 s), then coast
-    v_arrive=15.0,        # == v_cruise -> no braking; the run ends at the 50 m keep-out
+    v_cruise=16.0,        # single main burn up to this speed (~30 s), then coast
+    v_arrive=16.0,        # == v_cruise -> no braking; the run ends at the 50 m keep-out
     keep_out_m=50.0,
     tube_radius=80.0,
-    horizon_s=90.0,
+    horizon_s=120.0,
 )
 RADAR_N = 500             # ask for everything the radar has (it publishes 200)
 RADAR_EVERY = 6           # loop ticks between radar reads (60 Hz loop -> 10 Hz)
