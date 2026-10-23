@@ -1,0 +1,9 @@
+{
+  "runs_per_config": 2,
+  "configs": [
+    {"tag": "v16",     "v_cruise": 16.0, "v_arrive": 16.0},
+    {"tag": "v15",     "v_cruise": 15.0, "v_arrive": 15.0},
+    {"tag": "v17",     "v_cruise": 17.0, "v_arrive": 17.0},
+    {"tag": "v16-m6",  "v_cruise": 16.0, "v_arrive": 16.0, "margin_m": 6.0}
+  ]
+}

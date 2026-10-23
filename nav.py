@@ -388,8 +388,9 @@ class DebrisTracker:
 @dataclass
 class GuidanceParams:
     a_max: float = 0.5            # m/s^2, thruster cap (sim: 0.5)
-    v_cruise: float = 22.0        # m/s, speed reached by the single main burn
-    v_arrive: float = 22.0        # m/s, speed allowed at the keep-out boundary (== v_cruise: no brake)
+    v_cruise: float = 14.0        # m/s, single main burn. Fuel is ~0.0765 kg per m/s of delta-v and the
+                                  # nominal 1.15 kg is only ~15 m/s, so cruise + trims must fit that budget
+    v_arrive: float = 14.0        # m/s, speed allowed at the keep-out boundary (== v_cruise: no brake)
     keep_out_m: float = 50.0      # m, run ends inside this radius of the target
     tube_radius: float = 80.0     # m, only debris this close to the flight line is considered
     horizon_s: float = 90.0       # s, how far ahead closest approaches are evaluated
@@ -404,7 +405,8 @@ class GuidanceParams:
     lat_vel_deadband: float = 1.0 # m/s, cross-track drift tolerated before cleanup trim
     lat_vel_deadband_near: float = 0.3  # m/s, same, inside `near_m` of the goal
     near_m: float = 300.0
-    terminal_s: float = 20.0      # s to go below which we steer straight at the target (pursuit)
+    terminal_s: float = 20.0      # s to go below which the terminal steer may act
+    goal_margin_m: float = 10.0   # aim for the keep-out sphere shrunk by this; anywhere inside wins
     # direction + speed coasting search
     plan_wait_s: float = 2.0            # s, max wait for the first radar scan before planning
     plan_min_tracks: int = 50           # plan as soon as this many tracks exist
@@ -412,8 +414,11 @@ class GuidanceParams:
     plan_ring_points: int = 8
     plan_speed_fracs: tuple = (1.0, 0.8, 0.6)   # of v_cruise; slower only wins if faster conflicts
     plan_corridor_m: float = 300.0      # m, rocks farther than this from the start->target line are ignored
-    plan_offset_weight: float = 0.02    # s per m of aim offset (prefers staying near the target line)
-    plan_deficit_weight: float = 10.0   # s per m of clearance deficit (soft collision penalty)
+    plan_offset_weight: float = 0.0     # extra raw-score per m of aim offset (fuel cost already counts it)
+    plan_deficit_weight: float = 0.1    # raw-score per m of clearance deficit (soft collision penalty)
+    fuel_kg_per_dv: float = 0.0706   # measured in the sim (1.27 kg for 18.0 m/s commanded); model was 60/(80*9.8)=0.0765
+    fuel_nominal_kg: float = 1.15
+    nominal_time_s: float = 120.0
     replan_dv: float = 0.05             # m/s, any conflict needing more than this triggers a search
     replan_period_s: float = 3.0        # s, minimum spacing between searches
 
@@ -476,11 +481,15 @@ class Guidance:
         self.s_hat = self.s0_hat.copy()                  # current coast line
         self.v_plan = self.P.v_cruise
         self.plan: CoastPlan = None
+        self.plan_cost = None
         self.n_plans = 0
         self.last_plan_t = -1e9
         self.trimming = False
         self.burn_done = False
         self.last_threats: list[Threat] = []
+        self.dv_used = 0.0                      # m/s of commanded delta-v so far (fuel proxy)
+        self._last_t = None
+        self._last_a = np.zeros(3)
         self._taus = np.arange(0.0, self.P.horizon_s + 0.5, 0.5)
 
     # -- decomposition against the current coast line ---------------------------
@@ -591,9 +600,13 @@ class Guidance:
                 t_b = dvn / P.a_max
                 s_b = float(((v + v_t) * 0.5 * t_b) @ d)          # along-track distance covered in the burn
                 t_est = t_b + max(dist_aim - P.keep_out_m - s_b, 0.0) / speed
-                # terminal steer to the real goal costs roughly the lateral correction time
-                t_est += math.sqrt(2.0 * off / P.a_max) * 0.5
-                cost = t_est + P.plan_offset_weight * off
+                # terminal steer only for the part of the offset outside the keep-out sphere
+                off_out = max(off - (P.keep_out_m - P.goal_margin_m), 0.0)
+                dv_term = 2.0 * off_out / P.terminal_s
+                t_est += math.sqrt(2.0 * off_out / P.a_max) * 0.5
+                fuel_est = (self.dv_used + dvn + dv_term) * P.fuel_kg_per_dv
+                fuel_pen = max(fuel_est / P.fuel_nominal_kg - 1.0, 0.0)
+                cost = -P.nominal_time_s / max(t_est, 1.0) + fuel_pen + P.plan_offset_weight * off
                 min_margin = 1e9
                 if len(snap.tracks):
                     traj = lambda taus, p=p, v=v, v_t=v_t: self._burn_coast(p, v, v_t, P.a_max, taus)
@@ -606,9 +619,10 @@ class Guidance:
                         cost += P.plan_deficit_weight * float(deficit.sum())
                         hard = dist[ok] < snap.radius[ok] + P.shuttle_radius
                         if hard.any():
-                            cost += 1e4
+                            cost += 100.0
                 if best_cost is None or cost < best_cost - 1e-9:
                     best, best_cost = CoastPlan(aim, d, speed, off, t_est, min_margin, t), cost
+        self.plan_cost = best_cost
         self._adopt(best, p)
         return best
 
@@ -688,6 +702,18 @@ class Guidance:
 
     # -- main command law --------------------------------------------------------
     def command(self, t: float, p, v, tracks: list[CVTrack]) -> GuidanceOutput:
+        out = self._command(t, p, v, tracks)
+        # integrate commanded delta-v (what the fuel accounting charges for)
+        if self._last_t is not None and t > self._last_t:
+            self.dv_used += float(np.linalg.norm(self._last_a)) * (t - self._last_t)
+        self._last_t, self._last_a = t, out.accel_world
+        return out
+
+    @property
+    def fuel_est_kg(self) -> float:
+        return self.dv_used * self.P.fuel_kg_per_dv
+
+    def _command(self, t: float, p, v, tracks: list[CVTrack]) -> GuidanceOutput:
         P = self.P
         remaining = float(np.linalg.norm(self.p_goal - p)) - P.keep_out_m
         out = GuidanceOutput(np.zeros(3), "coast", remaining=remaining)
@@ -721,13 +747,27 @@ class Guidance:
             out.dv_needed = dv
             if (dv > P.replan_dv and t - self.last_plan_t > P.replan_period_s
                     and s_go / max(v_s, 1.0) > P.terminal_s):
+                # cost of simply trimming on the current line, in the planner's raw-score units
+                old_state = (self.plan, self.plan_cost, self.p_start.copy(), self.p_aim, self.s_hat.copy(),
+                             self.v_plan, self.burn_done, self.last_plan_t, self.n_plans)
+                rel_g = self.p_goal - p
+                e_g = rel_g - float(rel_g @ self.s_hat) * self.s_hat
+                off_out = max(float(np.linalg.norm(e_g)) - (P.keep_out_m - P.goal_margin_m), 0.0)
+                t_trim = remaining / max(v_s, 1.0) + math.sqrt(2.0 * off_out / P.a_max) * 0.5
+                fuel_trim = (self.dv_used + dv + 2.0 * off_out / P.terminal_s) * P.fuel_kg_per_dv
+                cost_trim = -P.nominal_time_s / max(t_trim, 1.0) + max(fuel_trim / P.fuel_nominal_kg - 1.0, 0.0)
                 plan = self.plan_coast(t, p, v, tracks)
-                if plan.min_margin > 0.0:
-                    # new coast line clears everything: fly its burn instead of trimming
+                if plan.min_margin > 0.0 and self.plan_cost < cost_trim:
+                    # new coast line clears everything and is cheaper than trimming: fly its burn
                     conflicts = []
                     out.threats = []
                     out.mode = "replan"
                     along, e, v_s, v_lat, s_go = self.decompose(p, v)
+                else:
+                    # keep the current line and trim (restore the plan the search overwrote)
+                    (self.plan, self.plan_cost, self.p_start, self.p_aim, self.s_hat,
+                     self.v_plan, self.burn_done, _, self.n_plans) = old_state
+                    self.last_plan_t = t
             if conflicts and (dv > P.dv_min_trim or self.trimming):
                 self.trimming = True
                 a_lat = n * min(P.a_max, max(dv / 0.5, 0.05))   # taper at the end of the trim
@@ -746,10 +786,17 @@ class Guidance:
         t_go = s_go / max(v_s, 1.0)
         rel_goal = self.p_goal - p
         e_goal = rel_goal - float(rel_goal @ self.s_hat) * self.s_hat
-        lat_need = float(np.linalg.norm(e_goal)) + float(np.linalg.norm(v_lat)) * t_go
+        # predicted lateral miss of the sphere centre when we pass it, and the nearest
+        # point of the (shrunk) keep-out sphere to that pass point: any point inside wins,
+        # so we never steer for the centre itself
+        R_ok = P.keep_out_m - P.goal_margin_m
+        m_pass = e_goal - v_lat * t_go
+        m_norm = float(np.linalg.norm(m_pass))
+        lat_need = max(m_norm - R_ok, 0.0) + 0.0
         lat_have = 0.25 * P.a_max * t_go * t_go
-        if s_go < 0.0 or t_go < P.terminal_s or lat_need > 0.8 * lat_have:
-            v_des = v_allow * unit(rel_goal)
+        aim_pt = self.p_goal - (m_pass / m_norm) * min(R_ok, m_norm) if m_norm > 1e-6 else self.p_goal
+        if s_go < 0.0 or (t_go < P.terminal_s and lat_need > 0.0) or lat_need > 0.8 * lat_have:
+            v_des = v_allow * unit(aim_pt - p)
             dv = v_des - v
             dvn = float(np.linalg.norm(dv))
             a_p = np.zeros(3)

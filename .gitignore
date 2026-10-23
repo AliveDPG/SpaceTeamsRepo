@@ -89,3 +89,8 @@ TAGS
 
 # VSCode's meta files
 **/.vscode/**
+
+# escape-from-phobos tooling
+run_overrides.json
+results/
+__pycache__/
