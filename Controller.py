@@ -81,7 +81,7 @@ GP = GuidanceParams(
     v_arrive=16.0,        # == v_cruise -> no braking; the run ends at the 50 m keep-out
     keep_out_m=50.0,
     tube_radius=80.0,
-    horizon_s=120.0,
+    horizon_s=90,
     plan_wait_s=0.5,      # the radar's full first scan is published at start-up; don't idle
 )
 # FUEL: JetSelectionActuator charges ~0.0765 kg per m/s of commanded delta-v (per-tick accrual at
@@ -91,13 +91,18 @@ CAMERA_ENABLED = False    # the image API exposes no depth (as_RGB8/RGB16/f32 on
                           # tracks the radar lacks, and each blocking capture stalls the 60 Hz loop ~0.3 s
 RADAR_N = 500             # ask for everything the radar has (it publishes 200)
 RADAR_EVERY = 6           # loop ticks between radar reads (60 Hz loop -> 10 Hz)
-CAMERA_PERIOD_S = 1.5     # seconds between captures (capture blocks ~0.1-0.3 s)
+CAMERA_PERIOD_S = 1     # seconds between captures (capture blocks ~0.1-0.3 s)
 CAMERA_ONLY_WHEN_COASTING = True
 CAMERA_RES = 384
 CAMERA_FOV = 60.0
 CAMERA_EV = 10.0
 BLOB_THRESHOLD = 40.0     # 0-255 grey; None = auto
 LOG_EVERY_S = 1.0
+# Automation (tools/autorun.py sets these through run_overrides.json): end the sim by itself
+# AUTO_STOP_S seconds after the run is decided (arrived, or damage over the threshold, or max time).
+AUTO_STOP_S = None        # e.g. 5.0 -> call st.stop_sim() 5 s after the result; None = never
+AUTO_STOP_MAX_T = 400.0   # s, give up and stop if the run is still going
+DAMAGE_THRESHOLD_J = 2.092e5
 # attitude: body +x along the planned coast direction (cameras look forward), +z "up".
 # Rotation jets burn fuel too, so the hold is DEADBANDED: correct only when the pointing error
 # exceeds ATT_DEADBAND_DEG (until it is back under ATT_SETTLE_DEG) or the body is spinning.
@@ -349,12 +354,31 @@ last_log_t = -1e9
 last_cmd_world = np.zeros(3)
 att_active = True          # start by slewing the nose onto the coast line, then hold in deadband
 arrived_latched = False
+decided_t = None           # sim time at which the run's outcome became known (for AUTO_STOP_S)
 exit_flag = False
 
 # ----------------------------------------------------------------------------- main loop
 while not exit_flag:
     time.sleep(1.0 / loop_hz)
     t = sim_time()
+
+    # ---- automation: notice when the run is decided and end the sim after AUTO_STOP_S ---------
+    if AUTO_STOP_S is not None:
+        if decided_t is None:
+            try:
+                _dmg = shuttle.GetParam(st.VarType.double, ["Stats", "Damage"])
+            except Exception:
+                _dmg = 0.0
+            if arrived_latched or _dmg > DAMAGE_THRESHOLD_J or t > AUTO_STOP_MAX_T:
+                decided_t = t
+                log(f"AUTOSTOP in {AUTO_STOP_S}s (arrived={arrived_latched} dmg={_dmg:.0f}J t={t:.1f})", "Auto")
+        elif t - decided_t >= AUTO_STOP_S:
+            log("AUTOSTOP stopping sim", "Auto")
+            SetCommand(np.zeros(3), np.zeros(3))
+            time.sleep(0.5)
+            st.stop_sim()
+            exit_flag = True
+            continue
 
     # ---- own state: sim fix + thruster accelerometer -> ShuttleNav -----------------
     lva = shuttle.getLocVelAcc()
@@ -374,7 +398,7 @@ while not exit_flag:
     # ---- radar -> world-frame tracks ----------------------------------------------
     if iteration % RADAR_EVERY == 0:
         try:
-            tracker.ingest_radar(GetNearestDebrisLocations(RADAR_N), nav.pos_at, t)
+            tracker.ingest_radar(GetNearestDebrisLocations(RADAR_N), nav.pos_at, t, v)
         except Exception as ex:
             log(f"Radar read failed: {ex}", "Radar", st.Severity.Warning)
         tracker.prune(t)
@@ -385,6 +409,11 @@ while not exit_flag:
         SetCommand(np.zeros(3), np.zeros(3))
         iteration += 1
         continue
+    if iteration % 30 == 0:
+        try:
+            guidance.fuel_used_kg = float(shuttle.GetParam(st.VarType.double, ["Stats", "FuelUsed"]))
+        except Exception:
+            pass
     out = guidance.command(t, p, v, tracker.tracks)
     if out.done and not arrived_latched:
         arrived_latched = True
@@ -463,6 +492,7 @@ while not exit_flag:
             f"conf={len(out.threats)} dv={out.dv_needed:4.2f} att={math.degrees(att_err):4.1f}deg "
             f"dmg={dmg:.0f}J fuel={fuel:.3f}kg(dv={guidance.dv_used:.1f}m/s est={guidance.fuel_est_kg:.2f}) "
             f"att={'on' if att_active else 'db'} frames={cams.frames}")
+        log(f"  radar {tracker.last_stats}", "RadarDiag")
         if out.threats:
             th = min(out.threats, key=lambda th: th.tau)
             log(f"  nearest conflict: id{th.track.id} tau={th.tau:4.1f}s miss={np.linalg.norm(th.miss):5.1f}m "

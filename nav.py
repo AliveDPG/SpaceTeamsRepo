@@ -252,9 +252,18 @@ class DebrisTracker:
     their time stamp, so each read only costs the ~dozen fresh entries.
     """
 
-    def __init__(self, sigma_pos=2.0, gate_m=12.0, max_age_s=12.0, time_offset=0.0):
+    def __init__(self, sigma_pos=2.0, gate_m=12.0, max_age_s=12.0, time_offset=0.0,
+                 radar_lag_mean_s=1.0, radar_lag_sigma_s=0.6, adapt_lag=True):
         self.tracks: list[CVTrack] = []
         self.R_radar = I3 * sigma_pos ** 2
+        # The radar builds its relative vectors from a copy of the shuttle state that is 0-2 s
+        # stale (entity physics sync), while stamping fresh time: returns are displaced along our
+        # velocity by v*lag.  We de-skew with the shuttle position at (stamp - mean lag), treat the
+        # spread as extra measurement noise along v, and refine the mean from the residuals.
+        self.radar_lag_mean_s = radar_lag_mean_s
+        self.radar_lag_sigma_s = radar_lag_sigma_s
+        self.adapt_lag = adapt_lag
+        self._lag_resid: deque = deque(maxlen=300)
         self.sigma_pos = sigma_pos
         self.gate_m = gate_m
         self.max_age_s = max_age_s
@@ -264,16 +273,28 @@ class DebrisTracker:
         self._seen: set = set()
         self._initial_done = False
         self._offset_samples = 0
+        self.last_stats = {}                 # per-read association diagnostics
 
     # -- array views --------------------------------------------------------------
     def snapshot(self, t: float) -> Snapshot:
         return make_snapshot(self.tracks, t)
 
-    def _associate(self, t: float, z: npt.NDArray, diameter: float, gate: float):
+    def _associate(self, t: float, z: npt.NDArray, diameter: float, gate: float, v_hat=None, gate_along=None):
+        """
+        Nearest track inside an ellipsoidal gate: `gate` across our velocity, `gate_along`
+        along it (radar returns carry a timing skew relative to our own state, which shows
+        up as an error along the flight direction that grows with speed).
+        """
         if not self.tracks:
             return None
         snap = self.snapshot(t)
-        d = np.linalg.norm(snap.pos - z, axis=1)
+        rel = snap.pos - z
+        if v_hat is not None and gate_along is not None and gate_along > gate:
+            along = rel @ v_hat
+            perp = np.linalg.norm(rel - along[:, None] * v_hat, axis=1)
+            d = np.sqrt((perp / gate) ** 2 + (along / gate_along) ** 2) * gate   # normalised to `gate`
+        else:
+            d = np.linalg.norm(rel, axis=1)
         diam = 2.0 * snap.radius
         size_ok = np.abs(diam - diameter) < 0.6 * np.maximum(diam, diameter) + 2.0
         d = np.where(size_ok, d, np.inf)
@@ -284,7 +305,7 @@ class DebrisTracker:
         self.tracks = [tr for tr in self.tracks if t - tr.last_update < self.max_age_s]
 
     # -- radar -----------------------------------------------------------------
-    def ingest_radar(self, entries, shuttle_pos_at, t_now: float = None) -> int:
+    def ingest_radar(self, entries, shuttle_pos_at, t_now: float = None, v_now=None) -> int:
         """
         entries: iterable of 3x3 radar matrices.
         shuttle_pos_at: callable(t) -> shuttle world position at time t.
@@ -303,6 +324,15 @@ class DebrisTracker:
                     self.time_offset = lag
                 self._offset_samples += 1
         applied = 0
+        st = dict(entries=len(entries), seen=0, new=0, upd=0, stale=0, nopos=0, fail_d=[])
+        speed = float(np.linalg.norm(v_now)) if v_now is not None else 0.0
+        v_hat = unit(v_now) if speed > 1.0 else None
+        # measurement covariance: radar noise, plus the lag spread along our velocity
+        R = self.R_radar.copy()
+        if v_hat is not None:
+            R += (self.radar_lag_sigma_s * speed) ** 2 * np.outer(v_hat, v_hat)
+        resids = []
+        newest_stamp = max((float(m[2, 0]) for m in entries), default=0.0)
         for m in entries:
             m = np.asarray(m, dtype=float)
             ts = float(m[2, 0]) + self.time_offset
@@ -313,22 +343,49 @@ class DebrisTracker:
             else:
                 key = (round(ts, 4), round(float(rel[0]), 2), round(float(rel[1]), 2), round(float(rel[2]), 2))
                 if key in self._seen:
+                    st["seen"] += 1
                     continue
                 self._seen.add(key)
             diameter = max(float(m[1, 2]), 0.2)
-            sp = shuttle_pos_at(ts)
+            sp = shuttle_pos_at(ts - self.radar_lag_mean_s)      # where the radar thought we were
             if sp is None:
+                st["nopos"] += 1
                 continue
             z = sp + rel
-            tr = self._associate(ts, z, diameter, self.gate_m + 0.15 * diameter)
+            gate = self.gate_m + 0.15 * diameter
+            tr = self._associate(ts, z, diameter, gate, v_hat, gate + 3.0 * self.radar_lag_sigma_s * speed)
             if tr is None:
-                self.tracks.append(CVTrack(ts, z, self.R_radar, diameter, source="radar"))
+                if self.tracks:
+                    snap = self.snapshot(ts)
+                    st["fail_d"].append(float(np.min(np.linalg.norm(snap.pos - z, axis=1))))
+                self.tracks.append(CVTrack(ts, z, R, diameter, source="radar"))
+                st["new"] += 1
             elif ts > tr.last_update + 1e-6:
-                tr.update_pos(ts, z, self.R_radar)
+                if v_hat is not None and speed > 3.0:
+                    resids.append(float((z - tr.pos_at(ts)) @ v_hat) / speed)   # implied extra lag, s
+                tr.update_pos(ts, z, R)
                 tr.update_diameter(diameter, 0.2)
+                st["upd"] += 1
             else:
+                st["stale"] += 1
                 continue
             applied += 1
+        fd = st.pop("fail_d")
+        st["fail_med_m"] = round(float(np.median(fd)), 1) if fd else None
+        # refine the mean lag from the along-track residuals of successful updates
+        self._lag_resid.extend(resids)
+        if self.adapt_lag and len(self._lag_resid) >= 40:
+            med = float(np.median(self._lag_resid))
+            self.radar_lag_mean_s = float(np.clip(self.radar_lag_mean_s + 0.2 * med, 0.0, 3.0))
+        st["lag_mean"] = round(self.radar_lag_mean_s, 2)
+        st["resid_med_s"] = round(float(np.median(resids)), 2) if resids else None
+        if self.tracks:
+            V = np.array([np.linalg.norm(tr.vel) for tr in self.tracks])
+            st["v_med"] = round(float(np.median(V)), 3)
+            st["v_max"] = round(float(V.max()), 2)
+        st["offset"] = round(self.time_offset, 3)
+        st["lag_now"] = round((t_now - newest_stamp) if t_now is not None else 0.0, 3)
+        self.last_stats = st
         self._initial_done = True
         if len(self._seen) > 20000:
             self._seen = set(sorted(self._seen)[-5000:])
@@ -488,6 +545,7 @@ class Guidance:
         self.burn_done = False
         self.last_threats: list[Threat] = []
         self.dv_used = 0.0                      # m/s of commanded delta-v so far (fuel proxy)
+        self.fuel_used_kg = None                # real Stats/FuelUsed when the controller feeds it
         self._last_t = None
         self._last_a = np.zeros(3)
         self._taus = np.arange(0.0, self.P.horizon_s + 0.5, 0.5)
@@ -604,7 +662,8 @@ class Guidance:
                 off_out = max(off - (P.keep_out_m - P.goal_margin_m), 0.0)
                 dv_term = 2.0 * off_out / P.terminal_s
                 t_est += math.sqrt(2.0 * off_out / P.a_max) * 0.5
-                fuel_est = (self.dv_used + dvn + dv_term) * P.fuel_kg_per_dv
+                fuel_so_far = self.fuel_used_kg if self.fuel_used_kg is not None else self.dv_used * P.fuel_kg_per_dv
+                fuel_est = fuel_so_far + (dvn + dv_term) * P.fuel_kg_per_dv
                 fuel_pen = max(fuel_est / P.fuel_nominal_kg - 1.0, 0.0)
                 cost = -P.nominal_time_s / max(t_est, 1.0) + fuel_pen + P.plan_offset_weight * off
                 min_margin = 1e9
@@ -754,7 +813,8 @@ class Guidance:
                 e_g = rel_g - float(rel_g @ self.s_hat) * self.s_hat
                 off_out = max(float(np.linalg.norm(e_g)) - (P.keep_out_m - P.goal_margin_m), 0.0)
                 t_trim = remaining / max(v_s, 1.0) + math.sqrt(2.0 * off_out / P.a_max) * 0.5
-                fuel_trim = (self.dv_used + dv + 2.0 * off_out / P.terminal_s) * P.fuel_kg_per_dv
+                fuel_so_far = self.fuel_used_kg if self.fuel_used_kg is not None else self.dv_used * P.fuel_kg_per_dv
+                fuel_trim = fuel_so_far + (dv + 2.0 * off_out / P.terminal_s) * P.fuel_kg_per_dv
                 cost_trim = -P.nominal_time_s / max(t_trim, 1.0) + max(fuel_trim / P.fuel_nominal_kg - 1.0, 0.0)
                 plan = self.plan_coast(t, p, v, tracks)
                 if plan.min_margin > 0.0 and self.plan_cost < cost_trim:

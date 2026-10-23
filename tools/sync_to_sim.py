@@ -60,10 +60,14 @@ def main():
 
     if not sim_dir.exists():
         sys.exit(f"sim folder not found: {sim_dir}")
+    stale_ovr = (sim_dir / "run_overrides.json").exists() and not (REPO / "run_overrides.json").exists()
     diff = differing(FILES)
-    if not diff:
+    if not diff and not stale_ovr:
         print("sim copy is up to date")
         return
+    if stale_ovr and not args.check:
+        (sim_dir / "run_overrides.json").unlink()
+        print("  removed stale run_overrides.json on the sim side")
     print("differs:", ", ".join(diff))
     if args.check:
         sys.exit(1)
