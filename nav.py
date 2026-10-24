@@ -415,9 +415,8 @@ class GuidanceParams:
     plan_ring_points: int = 8
     plan_speed_fracs: tuple = (1.0, 0.8, 0.6)   # of v_cruise; slower only wins if faster conflicts
     plan_corridor_m: float = 300.0      # m, rocks farther than this from the start->target line are ignored
-    plan_offset_weight: float = 0.0     # extra cost per m of aim offset outside the sphere (delta-v already counts it)
-    plan_deficit_weight: float = 0.5    # m/s of cost per m of clearance deficit (soft collision penalty)
-    plan_time_weight: float = 0.01      # m/s per second: tie-break only, faster wins at equal thrust
+    plan_offset_weight: float = 0.02    # s per m of aim offset (prefers staying near the target line)
+    plan_deficit_weight: float = 10.0   # s per m of clearance deficit (soft collision penalty)
     replan_dv: float = 0.05             # m/s, any conflict needing more than this triggers a search
     replan_period_s: float = 3.0        # s, minimum spacing between searches
 
@@ -480,7 +479,6 @@ class Guidance:
         self.s_hat = self.s0_hat.copy()                  # current coast line
         self.v_plan = self.P.v_cruise
         self.plan: CoastPlan = None
-        self.plan_cost = None
         self.n_plans = 0
         self.last_plan_t = -1e9
         self.trimming = False
@@ -580,8 +578,6 @@ class Guidance:
                             snap.radius[keep], snap.sigma[keep], snap.sigma_v[keep])
         e1, e2 = perp_basis(self.s0_hat)
         aims = [(self.p_goal.copy(), 0.0)]
-        if self.plan is not None:                       # "keep the current line" is a candidate too
-            aims.append((self.plan.aim, self.plan.offset))
         for r in P.plan_offsets_m:
             if r <= 0.0:
                 continue
@@ -599,11 +595,10 @@ class Guidance:
                 t_b = dvn / P.a_max
                 s_b = float(((v + v_t) * 0.5 * t_b) @ d)          # along-track distance covered in the burn
                 t_est = t_b + max(dist_aim - P.keep_out_m - s_b, 0.0) / speed
-                # thrust needed: the burn onto the new coast velocity, plus the later aim correction
-                # for the part of the offset that lies outside the keep-out sphere (~off / time to go)
-                off_out = max(off - (P.keep_out_m - P.goal_margin_m), 0.0)
-                dv_aim = off_out / max(0.5 * t_est, 5.0)
-                cost = dvn + dv_aim + P.plan_offset_weight * off_out + P.plan_time_weight * t_est
+                # terminal steer to the real goal costs roughly the lateral correction time
+                off_out = max(off - (P.keep_out_m - P.goal_margin_m), 0.0)   # part outside the sphere
+                t_est += math.sqrt(2.0 * off_out / P.a_max) * 0.5
+                cost = t_est + P.plan_offset_weight * off_out
                 min_margin = 1e9
                 if len(snap.tracks):
                     traj = lambda taus, p=p, v=v, v_t=v_t: self._burn_coast(p, v, v_t, P.a_max, taus)
@@ -616,10 +611,9 @@ class Guidance:
                         cost += P.plan_deficit_weight * float(deficit.sum())
                         hard = dist[ok] < snap.radius[ok] + P.shuttle_radius
                         if hard.any():
-                            cost += 100.0
+                            cost += 1e4
                 if best_cost is None or cost < best_cost - 1e-9:
                     best, best_cost = CoastPlan(aim, d, speed, off, t_est, min_margin, t), cost
-        self.plan_cost = best_cost
         self._adopt(best, p)
         return best
 
@@ -728,25 +722,17 @@ class Guidance:
         # ---- cross-track: avoidance trims, or a re-plan when the trim would be big ---------
         a_lat = np.zeros(3)
         if conflicts:
-            # option A: the cheapest lateral trim that clears every threat (min delta-v over 16 directions)
             n, dv = self.plan_lateral(threats)
             out.dv_needed = dv
             if (dv > P.replan_dv and t - self.last_plan_t > P.replan_period_s
                     and s_go / max(v_s, 1.0) > P.terminal_s):
-                # option B: a new coast line / speed, scored by the thrust it needs.  Take it only
-                # if it clears everything AND needs less thrust than the trim.
-                saved = (self.plan, self.plan_cost, self.p_start.copy(), self.p_aim, self.s_hat.copy(),
-                         self.v_plan, self.burn_done, self.last_plan_t, self.n_plans)
                 plan = self.plan_coast(t, p, v, tracks)
-                if plan.min_margin > 0.0 and self.plan_cost < dv:
+                if plan.min_margin > 0.0:
+                    # new coast line clears everything: fly its burn instead of trimming
                     conflicts = []
                     out.threats = []
                     out.mode = "replan"
                     along, e, v_s, v_lat, s_go = self.decompose(p, v)
-                else:
-                    (self.plan, self.plan_cost, self.p_start, self.p_aim, self.s_hat,
-                     self.v_plan, self.burn_done, _, self.n_plans) = saved
-                    self.last_plan_t = t
             if conflicts and (dv > P.dv_min_trim or self.trimming):
                 self.trimming = True
                 a_lat = n * min(P.a_max, max(dv / 0.5, 0.05))   # taper at the end of the trim
